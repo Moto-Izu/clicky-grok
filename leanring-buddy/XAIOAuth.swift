@@ -9,8 +9,8 @@
 import AppKit
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
-import Network
 import Security
 
 enum XAIOAuthError: LocalizedError {
@@ -392,9 +392,11 @@ final class XAIOAuthAuthenticator: ObservableObject {
     }
 }
 
-// MARK: - Local loopback callback server (NWListener)
+// MARK: - Local loopback callback server (IPv4 127.0.0.1 POSIX)
 
-/// Minimal HTTP/1.1 server that accepts a single OAuth redirect on 127.0.0.1.
+/// HTTP/1.1 loopback server for OAuth redirects.
+/// Binds explicitly to IPv4 `127.0.0.1` (browsers redirect there; NWListener
+/// often only shows up as IPv6 `*:port`, which causes empty/failed callbacks).
 final class LocalOAuthCallbackServer {
     struct CallbackResult {
         let code: String?
@@ -407,10 +409,13 @@ final class LocalOAuthCallbackServer {
     private let path: String
     private let expectedState: String
     private let preferredPort: UInt16
-    private var listener: NWListener?
+    private var serverFD: Int32 = -1
+    private var boundPort: UInt16 = 0
+    private var acceptSource: DispatchSourceRead?
     private var continuation: CheckedContinuation<CallbackResult, Error>?
     private let queue = DispatchQueue(label: "so.clicky.xai-oauth.callback")
     private var didFinish = false
+    private var timeoutWorkItem: DispatchWorkItem?
 
     init(preferredPort: UInt16, path: String, expectedState: String) throws {
         self.path = path
@@ -418,121 +423,213 @@ final class LocalOAuthCallbackServer {
         self.preferredPort = preferredPort
     }
 
-    /// Starts listening and returns the exact redirect URI (with bound port).
-    func start() async throws -> String {
-        let parameters = NWParameters.tcp
-        let portsToTry: [NWEndpoint.Port] = [
-            NWEndpoint.Port(rawValue: preferredPort),
-            .any,
-        ].compactMap { $0 }
+    deinit {
+        closeServer()
+    }
 
-        var lastError: Error?
+    /// Starts listening on 127.0.0.1 and returns the redirect URI.
+    func start() async throws -> String {
+        let portsToTry: [UInt16] = [preferredPort, 0]
+        var lastError: Error = XAIOAuthError.serverStartFailed
+
         for port in portsToTry {
             do {
-                let listener = try NWListener(using: parameters, on: port)
-                self.listener = listener
-                break
+                let fd = try Self.bindListeningSocket(port: port)
+                serverFD = fd
+                boundPort = try Self.portOfSocket(fd)
+                redirectURI = "http://127.0.0.1:\(boundPort)\(path)"
+                startAcceptLoop()
+                print("🔐 xAI OAuth callback listening on \(redirectURI)")
+                return redirectURI
             } catch {
                 lastError = error
+                closeServer()
             }
         }
-        guard let listener else {
-            throw lastError ?? XAIOAuthError.serverStartFailed
-        }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            var settled = false
-            listener.stateUpdateHandler = { [weak self] state in
-                guard let self else { return }
-                switch state {
-                case .ready:
-                    if let port = listener.port {
-                        self.redirectURI = "http://127.0.0.1:\(port.rawValue)\(self.path)"
-                    }
-                    guard !settled else { return }
-                    settled = true
-                    continuation.resume()
-                case .failed(let error):
-                    guard !settled else { return }
-                    settled = true
-                    continuation.resume(throwing: error)
-                default:
-                    break
-                }
-            }
-
-            listener.newConnectionHandler = { [weak self] connection in
-                self?.handle(connection: connection)
-            }
-
-            listener.start(queue: self.queue)
-        }
-
-        if redirectURI.isEmpty {
-            redirectURI = "http://127.0.0.1:\(preferredPort)\(path)"
-        }
-        return redirectURI
+        throw lastError
     }
 
     func waitForCallback(timeout: TimeInterval) async throws -> CallbackResult {
         try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation
-
-            queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            let work = DispatchWorkItem { [weak self] in
                 self?.finish(.failure(XAIOAuthError.callbackTimeout))
             }
+            self.timeoutWorkItem = work
+            queue.asyncAfter(deadline: .now() + timeout, execute: work)
         }
     }
 
-    private func handle(connection: NWConnection) {
-        connection.start(queue: queue)
-        receive(on: connection, buffer: Data())
+    // MARK: - Socket setup
+
+    private static func bindListeningSocket(port: UInt16) throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw XAIOAuthError.serverStartFailed
+        }
+
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+        // Avoid SIGPIPE on send
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+
+        // Non-blocking accept loop via GCD
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                bind(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            close(fd)
+            throw XAIOAuthError.serverStartFailed
+        }
+
+        guard listen(fd, 16) == 0 else {
+            close(fd)
+            throw XAIOAuthError.serverStartFailed
+        }
+
+        return fd
     }
 
-    private func receive(on connection: NWConnection, buffer: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let error {
-                connection.cancel()
-                self.finish(.failure(error))
+    private static func portOfSocket(_ fd: Int32) throws -> UInt16 {
+        var addr = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let result = withUnsafeMutablePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                getsockname(fd, sockPtr, &len)
+            }
+        }
+        guard result == 0 else {
+            throw XAIOAuthError.serverStartFailed
+        }
+        return UInt16(bigEndian: addr.sin_port)
+    }
+
+    private func startAcceptLoop() {
+        let fd = serverFD
+        guard fd >= 0 else { return }
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            self?.acceptClients()
+        }
+        source.setCancelHandler {
+            // fd closed in closeServer()
+        }
+        acceptSource = source
+        source.resume()
+    }
+
+    private func acceptClients() {
+        while true {
+            var addr = sockaddr_in()
+            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let client = withUnsafeMutablePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                    accept(serverFD, sockPtr, &len)
+                }
+            }
+            if client < 0 {
+                let err = errno
+                if err == EAGAIN || err == EWOULDBLOCK { return }
+                print("⚠️ OAuth accept error: \(err)")
                 return
             }
-
-            var next = buffer
-            if let data { next.append(data) }
-
-            if let range = next.range(of: Data("\r\n\r\n".utf8)) {
-                let headerData = next.subdata(in: next.startIndex..<range.lowerBound)
-                let headerText = String(data: headerData, encoding: .utf8) ?? ""
-                self.respond(connection: connection, requestHeaders: headerText)
-                return
+            // Handle each client off the accept path so we can keep listening
+            // for probes / favicon until the real OAuth callback arrives.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.handleClient(clientFD: client)
             }
-
-            if isComplete {
-                connection.cancel()
-                self.finish(.failure(XAIOAuthError.authorizationFailed("empty callback")))
-                return
-            }
-
-            self.receive(on: connection, buffer: next)
         }
     }
 
-    private func respond(connection: NWConnection, requestHeaders: String) {
-        let firstLine = requestHeaders.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
-        // e.g. GET /callback?code=...&state=... HTTP/1.1
-        let parts = firstLine.split(separator: " ")
-        guard parts.count >= 2 else {
-            sendHTML(connection: connection, status: 400, body: "<h1>Bad request</h1>")
-            finish(.failure(XAIOAuthError.authorizationFailed("malformed callback request")))
+    private func handleClient(clientFD: Int32) {
+        defer { close(clientFD) }
+
+        var yes: Int32 = 1
+        setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+
+        // Blocking reads with a short timeout for this client only
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+
+        var buffer = Data()
+        var chunk = [UInt8](repeating: 0, count: 8192)
+
+        while buffer.count < 64 * 1024 {
+            let n = read(clientFD, &chunk, chunk.count)
+            if n < 0 {
+                let err = errno
+                if err == EINTR { continue }
+                print("⚠️ OAuth client read error: \(err)")
+                return // ignore probe / failed connections
+            }
+            if n == 0 { break }
+            buffer.append(contentsOf: chunk[0..<n])
+
+            // Header terminator (CRLF or bare LF)
+            if buffer.range(of: Data("\r\n\r\n".utf8)) != nil
+                || buffer.range(of: Data("\n\n".utf8)) != nil {
+                break
+            }
+        }
+
+        guard !buffer.isEmpty,
+              let requestText = String(data: buffer, encoding: .utf8) else {
+            print("⚠️ OAuth ignored empty client connection")
             return
         }
 
+        print("🔐 OAuth callback request (\(buffer.count) bytes):\n\(requestText.prefix(400))")
+
+        let headerSection: String
+        if let range = requestText.range(of: "\r\n\r\n") {
+            headerSection = String(requestText[..<range.lowerBound])
+        } else if let range = requestText.range(of: "\n\n") {
+            headerSection = String(requestText[..<range.lowerBound])
+        } else {
+            headerSection = requestText
+        }
+
+        let firstLine = headerSection.split(whereSeparator: { $0 == "\r" || $0 == "\n" })
+            .first
+            .map(String.init) ?? ""
+        let parts = firstLine.split(separator: " ")
+        guard parts.count >= 2 else {
+            sendHTML(clientFD: clientFD, status: 400, body: "<h1>Bad request</h1>")
+            return
+        }
+
+        let method = String(parts[0]).uppercased()
         let target = String(parts[1])
-        guard let url = URL(string: "http://127.0.0.1\(target)"),
-              url.path == path else {
-            sendHTML(connection: connection, status: 404, body: "<h1>Not found</h1>")
-            finish(.failure(XAIOAuthError.authorizationFailed("unexpected callback path")))
+
+        // Browsers may request /favicon.ico etc. — ignore, keep waiting.
+        guard method == "GET" || method == "HEAD" else {
+            sendHTML(clientFD: clientFD, status: 405, body: "<h1>Method not allowed</h1>")
+            return
+        }
+
+        guard let url = URL(string: target.hasPrefix("http") ? target : "http://127.0.0.1\(target)") else {
+            sendHTML(clientFD: clientFD, status: 400, body: "<h1>Bad request</h1>")
+            return
+        }
+
+        // Accept /callback even if trailing slash differs
+        let requestPath = url.path
+        guard requestPath == path || requestPath == path + "/" else {
+            print("⚠️ OAuth ignored non-callback path: \(requestPath)")
+            sendHTML(clientFD: clientFD, status: 404, body: "<h1>Not found</h1>")
             return
         }
 
@@ -548,40 +645,73 @@ final class LocalOAuthCallbackServer {
             errorDescription: value("error_description")
         )
 
-        if result.state != expectedState {
-            sendHTML(connection: connection, status: 400, body: "<h1>xAI authorization state mismatch.</h1>")
-            finish(.failure(XAIOAuthError.authorizationFailed("state mismatch")))
+        // Real OAuth redirect must include code or error (+ state).
+        guard result.code != nil || result.error != nil else {
+            print("⚠️ OAuth callback path hit without code/error — still waiting")
+            sendHTML(clientFD: clientFD, status: 200, body: "<h1>Waiting for OAuth…</h1>")
             return
         }
 
+        // Require matching state when a successful code is returned.
+        if result.error == nil {
+            guard let state = result.state, state == expectedState else {
+                sendHTML(clientFD: clientFD, status: 400, body: "<h1>xAI authorization state mismatch.</h1>")
+                finish(.failure(XAIOAuthError.authorizationFailed("state mismatch")))
+                return
+            }
+        }
+
         if result.error != nil {
-            sendHTML(connection: connection, status: 200, body: "<h1>xAI authorization failed.</h1><p>You can close this tab.</p>")
+            sendHTML(
+                clientFD: clientFD,
+                status: 200,
+                body: "<h1>xAI authorization failed.</h1><p>You can close this tab and return to Clicky.</p>"
+            )
         } else {
-            sendHTML(connection: connection, status: 200, body: "<h1>xAI authorization received.</h1><p>You can close this tab and return to Clicky.</p>")
+            sendHTML(
+                clientFD: clientFD,
+                status: 200,
+                body: "<h1>xAI authorization received.</h1><p>You can close this tab and return to Clicky.</p>"
+            )
         }
 
         finish(.success(result))
     }
 
-    private func sendHTML(connection: NWConnection, status: Int, body: String) {
-        let statusText = status == 200 ? "OK" : (status == 404 ? "Not Found" : "Bad Request")
-        let html = "<!DOCTYPE html><html><body>\(body)</body></html>"
+    private func sendHTML(clientFD: Int32, status: Int, body: String) {
+        let statusText: String
+        switch status {
+        case 200: statusText = "OK"
+        case 404: statusText = "Not Found"
+        case 405: statusText = "Method Not Allowed"
+        default: statusText = "Bad Request"
+        }
+        let html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Clicky xAI</title></head><body>\(body)</body></html>"
         let response =
             "HTTP/1.1 \(status) \(statusText)\r\n" +
             "Content-Type: text/html; charset=utf-8\r\n" +
             "Content-Length: \(html.utf8.count)\r\n" +
             "Connection: close\r\n\r\n" +
             html
-        connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
-            connection.cancel()
-        })
+        let data = Data(response.utf8)
+        data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return }
+            var offset = 0
+            while offset < data.count {
+                let written = write(clientFD, base.advanced(by: offset), data.count - offset)
+                if written <= 0 { break }
+                offset += written
+            }
+        }
     }
 
     private func finish(_ result: Result<CallbackResult, Error>) {
         queue.async {
             guard !self.didFinish else { return }
             self.didFinish = true
-            self.listener?.cancel()
+            self.timeoutWorkItem?.cancel()
+            self.timeoutWorkItem = nil
+            self.closeServer()
             guard let continuation = self.continuation else { return }
             self.continuation = nil
             switch result {
@@ -590,6 +720,15 @@ final class LocalOAuthCallbackServer {
             case .failure(let error):
                 continuation.resume(throwing: error)
             }
+        }
+    }
+
+    private func closeServer() {
+        acceptSource?.cancel()
+        acceptSource = nil
+        if serverFD >= 0 {
+            close(serverFD)
+            serverFD = -1
         }
     }
 }
