@@ -234,7 +234,7 @@ private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscription
         )
         requestBodyData.appendMultipartFormField(
             named: "language",
-            value: "en",
+            value: "ja",
             usingBoundary: boundary
         )
         requestBodyData.appendMultipartFormField(

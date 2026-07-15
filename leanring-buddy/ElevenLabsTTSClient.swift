@@ -103,8 +103,9 @@ final class ElevenLabsTTSClient: NSObject, AVSpeechSynthesizerDelegate {
         let utterance = AVSpeechUtterance(string: text)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
-        // Prefer a natural English voice when available
-        if let voice = AVSpeechSynthesisVoice(language: "en-US") {
+        // Prefer Japanese voice for this fork; fall back to system default.
+        if let voice = AVSpeechSynthesisVoice(language: "ja-JP")
+            ?? AVSpeechSynthesisVoice(language: "ja") {
             utterance.voice = voice
         }
 

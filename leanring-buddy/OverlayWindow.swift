@@ -170,15 +170,15 @@ struct BlueCursorView: View {
     private let onboardingVideoPlayerWidth: CGFloat = 330
     private let onboardingVideoPlayerHeight: CGFloat = 186
 
-    private let fullWelcomeMessage = "hey! i'm clicky"
+    private let fullWelcomeMessage = "やあ！クリックーだよ"
 
     private let navigationPointerPhrases = [
-        "right here!",
-        "this one!",
-        "over here!",
-        "click this!",
-        "here it is!",
-        "found it!"
+        "ここだよ！",
+        "これこれ！",
+        "こっち！",
+        "これを押して！",
+        "見つかった！",
+        "ここ！"
     ]
 
     var body: some View {

@@ -42,18 +42,22 @@ final class AppleSpeechTranscriptionProvider: BuddyTranscriptionProvider {
     }
 
     private static func makeBestAvailableSpeechRecognizer() -> SFSpeechRecognizer? {
+        // Prefer Japanese for this Grok fork; fall back to system / English.
         let preferredLocales = [
+            Locale(identifier: "ja-JP"),
             Locale.autoupdatingCurrent,
-            Locale(identifier: "en-US")
+            Locale(identifier: "en-US"),
         ]
 
         for preferredLocale in preferredLocales {
-            if let speechRecognizer = SFSpeechRecognizer(locale: preferredLocale) {
+            if let speechRecognizer = SFSpeechRecognizer(locale: preferredLocale),
+               speechRecognizer.isAvailable {
                 return speechRecognizer
             }
         }
 
-        return SFSpeechRecognizer()
+        return SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
+            ?? SFSpeechRecognizer()
     }
 }
 
