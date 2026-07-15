@@ -68,10 +68,6 @@ final class CompanionManager: ObservableObject {
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
-    /// Base URL for the Cloudflare Worker proxy (TTS + transcription only).
-    /// Chat goes directly to xAI via OAuth — no Anthropic key required.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
-
     /// xAI OAuth session (SuperGrok / X Premium). Tokens live in Keychain.
     let xaiOAuth = XAIOAuthAuthenticator.shared
 
@@ -80,7 +76,10 @@ final class CompanionManager: ObservableObject {
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+        return ElevenLabsTTSClient(
+            proxyURL: ClickyServiceConfig.ttsProxyURL,
+            usesWorker: ClickyServiceConfig.isWorkerConfigured
+        )
     }()
 
     /// Conversation history so Grok remembers prior exchanges within a session.
@@ -734,12 +733,12 @@ final class CompanionManager: ObservableObject {
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     do {
                         try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
+                        // speakText returns after playback starts
                         voiceState = .responding
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        print("⚠️ TTS error: \(error)")
+                        speakSystemFallback(spokenText)
                     }
                 }
             } catch is CancellationError {
@@ -787,9 +786,15 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// calls fail. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
+    /// Speaks an error (or arbitrary) message using system TTS.
+    private func speakSystemFallback(_ text: String) {
+        Task {
+            try? await elevenLabsTTSClient.speakText(text)
+            voiceState = .responding
+        }
+    }
+
+    /// Speaks a hardcoded error message when Grok / OAuth fails.
     private func speakCreditsErrorFallback() {
         let utterance: String
         if !xaiOAuth.isAuthenticated {
@@ -797,9 +802,7 @@ final class CompanionManager: ObservableObject {
         } else {
             utterance = "Something went wrong talking to Grok. Check your x A I login and try again."
         }
-        let synthesizer = NSSpeechSynthesizer()
-        synthesizer.startSpeaking(utterance)
-        voiceState = .responding
+        speakSystemFallback(utterance)
     }
 
     // MARK: - Point Tag Parsing
