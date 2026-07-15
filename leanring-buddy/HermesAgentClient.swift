@@ -17,10 +17,10 @@ struct HermesAgentClientError: LocalizedError {
 /// Runs a single turn against a local Hermes Agent process.
 @MainActor
 final class HermesAgentClient {
+    private static let sessionIDDefaultsKey = "clickyHermesSessionId"
+
     /// Absolute or PATH-resolved hermes binary.
     var hermesBinary: String
-    /// Session name for --continue (conversation continuity).
-    var sessionName: String
     /// Comma-separated Hermes toolsets (must include computer_use for GUI ops).
     var toolsets: String
     /// Max tool-calling iterations for one user utterance.
@@ -30,20 +30,36 @@ final class HermesAgentClient {
     /// Working directory for the agent (optional).
     var workingDirectory: String?
 
+    /// Last known Hermes session id (resumed with --resume).
+    private(set) var sessionID: String? {
+        didSet {
+            if let sessionID, !sessionID.isEmpty {
+                UserDefaults.standard.set(sessionID, forKey: Self.sessionIDDefaultsKey)
+            }
+        }
+    }
+
     init(
         hermesBinary: String = ClickyServiceConfig.hermesBinary,
-        sessionName: String = ClickyServiceConfig.hermesSessionName,
         toolsets: String = ClickyServiceConfig.hermesToolsets,
         maxTurns: Int = ClickyServiceConfig.hermesMaxTurns,
         yolo: Bool = ClickyServiceConfig.hermesYolo,
         workingDirectory: String? = ClickyServiceConfig.hermesWorkingDirectory
     ) {
         self.hermesBinary = hermesBinary
-        self.sessionName = sessionName
         self.toolsets = toolsets
         self.maxTurns = maxTurns
         self.yolo = yolo
         self.workingDirectory = workingDirectory
+        // Load prior session for --resume (not --continue name, which errors if missing)
+        let stored = UserDefaults.standard.string(forKey: Self.sessionIDDefaultsKey)
+        self.sessionID = (stored?.isEmpty == false) ? stored : nil
+    }
+
+    /// Clears stored session so the next turn starts a fresh Hermes conversation.
+    func resetSession() {
+        sessionID = nil
+        UserDefaults.standard.removeObject(forKey: Self.sessionIDDefaultsKey)
     }
 
     /// Sends `userPrompt` with optional screenshot path(s). Returns spoken reply text.
@@ -53,10 +69,6 @@ final class HermesAgentClient {
         systemContext: String = ""
     ) async throws -> (text: String, duration: TimeInterval, sessionID: String?) {
         let start = Date()
-        let resolvedBinary = try resolveHermesBinary()
-
-        // Hermes CLI currently accepts a single --image; use the first (cursor screen).
-        let primaryImage = imagePaths.first
 
         var fullPrompt = ""
         if !systemContext.isEmpty {
@@ -65,26 +77,76 @@ final class HermesAgentClient {
         }
         fullPrompt += userPrompt
 
+        // First attempt: resume stored session if any.
+        // On "No session found" / empty / resume errors → retry without resume.
+        do {
+            let result = try await invokeHermes(
+                prompt: fullPrompt,
+                imagePath: imagePaths.first,
+                resumeSessionID: sessionID
+            )
+            let duration = Date().timeIntervalSince(start)
+            if let newID = result.sessionID, !newID.isEmpty {
+                sessionID = newID
+            }
+            return (text: result.text, duration: duration, sessionID: sessionID)
+        } catch {
+            let message = error.localizedDescription.lowercased()
+            let shouldRetryFresh = message.contains("no session")
+                || message.contains("not found")
+                || message.contains("empty reply")
+            guard shouldRetryFresh, sessionID != nil else { throw error }
+
+            print("⚠️ Hermes resume failed (\(error.localizedDescription)); starting a new session")
+            resetSession()
+            let result = try await invokeHermes(
+                prompt: fullPrompt,
+                imagePath: imagePaths.first,
+                resumeSessionID: nil
+            )
+            let duration = Date().timeIntervalSince(start)
+            if let newID = result.sessionID, !newID.isEmpty {
+                sessionID = newID
+            }
+            return (text: result.text, duration: duration, sessionID: sessionID)
+        }
+    }
+
+    // MARK: - Invoke
+
+    private func invokeHermes(
+        prompt: String,
+        imagePath: String?,
+        resumeSessionID: String?
+    ) async throws -> (text: String, sessionID: String?) {
+        let resolvedBinary = try resolveHermesBinary()
+
         var args: [String] = [
             "chat",
-            "-q", fullPrompt,
+            "-q", prompt,
             "-Q",
             "--max-turns", String(maxTurns),
-            "--continue", sessionName,
             "--source", "clicky",
         ]
+
+        // IMPORTANT: do NOT use `--continue <name>`.
+        // That flag resumes a *named* session; if missing, Hermes prints
+        // "No session found matching '…'" and exits — which Clicky was reading as TTS.
+        if let resumeSessionID, !resumeSessionID.isEmpty {
+            args += ["--resume", resumeSessionID]
+        }
 
         if !toolsets.isEmpty {
             args += ["-t", toolsets]
         }
-        if let primaryImage, !primaryImage.isEmpty {
-            args += ["--image", primaryImage]
+        if let imagePath, !imagePath.isEmpty {
+            args += ["--image", imagePath]
         }
         if yolo {
             args.append("--yolo")
         }
 
-        print("🤖 Hermes: \(resolvedBinary) \(args.joined(separator: " ").prefix(200))…")
+        print("🤖 Hermes: \(resolvedBinary) … resume=\(resumeSessionID ?? "new") tools=\(toolsets)")
 
         let (stdout, stderr, exitCode) = try await runProcess(
             executable: resolvedBinary,
@@ -92,8 +154,12 @@ final class HermesAgentClient {
             workingDirectory: workingDirectory
         )
 
-        let duration = Date().timeIntervalSince(start)
-        let sessionID = Self.extractSessionID(from: stdout + "\n" + stderr)
+        let combined = stdout + "\n" + stderr
+        if Self.looksLikeMissingSession(combined) {
+            throw HermesAgentClientError(message: "No session found")
+        }
+
+        let newSessionID = Self.extractSessionID(from: combined)
         let reply = Self.extractReplyText(stdout: stdout, stderr: stderr)
 
         if exitCode != 0 && reply.isEmpty {
@@ -107,8 +173,13 @@ final class HermesAgentClient {
             throw HermesAgentClientError(message: "Hermes returned an empty reply.")
         }
 
-        print("🤖 Hermes reply (\(String(format: "%.1f", duration))s): \(reply.prefix(120))…")
-        return (text: reply, duration: duration, sessionID: sessionID)
+        // Reject nonsense that used to get spoken aloud
+        if Self.looksLikeMissingSession(reply) || reply.lowercased().contains("use 'hermes sessions") {
+            throw HermesAgentClientError(message: "No session found")
+        }
+
+        print("🤖 Hermes reply: \(reply.prefix(160))…")
+        return (text: reply, sessionID: newSessionID)
     }
 
     // MARK: - Process
@@ -124,18 +195,11 @@ final class HermesAgentClient {
 
         let fileManager = FileManager.default
         for path in candidates where !path.isEmpty {
-            if path == "hermes" { continue }
             if fileManager.isExecutableFile(atPath: path) {
                 return path
             }
         }
 
-        // Fall back to `which hermes` via /usr/bin/env
-        if fileManager.isExecutableFile(atPath: "/usr/bin/env") {
-            return "/usr/bin/env" // caller must pass "hermes" as first arg — handled below
-        }
-
-        // Last resort: search PATH manually
         if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
             for dir in pathEnv.split(separator: ":") {
                 let candidate = "\(dir)/hermes"
@@ -157,31 +221,22 @@ final class HermesAgentClient {
     ) async throws -> (stdout: String, stderr: String, exitCode: Int32) {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
-            var args = arguments
-            var exec = executable
-
-            // If we only know "env", run `env hermes …`
-            if executable.hasSuffix("/env") || executable == "/usr/bin/env" {
-                exec = "/usr/bin/env"
-                args = ["hermes"] + arguments
-            }
-
-            process.executableURL = URL(fileURLWithPath: exec)
-            process.arguments = args
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
             if let workingDirectory, !workingDirectory.isEmpty {
                 process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
             }
 
             var env = ProcessInfo.processInfo.environment
-            // Ensure local user bin is on PATH for hermes + cua-driver
             let extraPath = "\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin"
             if let existing = env["PATH"] {
                 env["PATH"] = "\(extraPath):\(existing)"
             } else {
                 env["PATH"] = extraPath
             }
-            // Non-interactive: don't wait on TTY prompts when yolo is off and something slips through
             env["HERMES_ACCEPT_HOOKS"] = "1"
+            // Quieter child process noise
+            env["PYTHONUNBUFFERED"] = "1"
             process.environment = env
 
             let outPipe = Pipe()
@@ -208,6 +263,12 @@ final class HermesAgentClient {
 
     // MARK: - Output parsing
 
+    private static func looksLikeMissingSession(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("no session found matching")
+            || lower.contains("no session found")
+    }
+
     private static func extractSessionID(from text: String) -> String? {
         for line in text.split(whereSeparator: \.isNewline) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -221,8 +282,9 @@ final class HermesAgentClient {
 
     /// Pull the final natural-language reply out of hermes -Q stdout/stderr.
     private static func extractReplyText(stdout: String, stderr: String) -> String {
-        let combined = (stdout + "\n" + stderr)
-            .replacingOccurrences(of: "\r\n", with: "\n")
+        // Prefer stdout only — session_id and warnings usually go to stderr.
+        let primary = stdout.replacingOccurrences(of: "\r\n", with: "\n")
+        let secondary = stderr.replacingOccurrences(of: "\r\n", with: "\n")
 
         let noisePrefixes = [
             "session_id:",
@@ -234,30 +296,42 @@ final class HermesAgentClient {
             "Traceback",
             "Reached maximum",
             "I reached the maximum",
+            "No session found",
+            "Use 'hermes sessions",
+            "Preview",
+            "────",
+            "↻",
+            "Resumed session",
         ]
 
-        let lines = combined
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+        func clean(_ text: String) -> String {
+            let lines = text
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
 
-        var kept: [String] = []
-        for line in lines {
-            if line.isEmpty {
-                if !kept.isEmpty { kept.append("") }
-                continue
+            var kept: [String] = []
+            for line in lines {
+                if line.isEmpty {
+                    if !kept.isEmpty { kept.append("") }
+                    continue
+                }
+                if noisePrefixes.contains(where: { line.hasPrefix($0) || line.contains($0) && $0.hasPrefix("No session") }) {
+                    continue
+                }
+                if line.lowercased().contains("no session found") { continue }
+                if line.lowercased().contains("use 'hermes sessions") { continue }
+                if line.allSatisfy({ $0 == "." || $0 == " " || $0 == "─" }) { continue }
+                kept.append(line)
             }
-            if noisePrefixes.contains(where: { line.hasPrefix($0) }) {
-                continue
-            }
-            // Drop pure spinner / progress junk
-            if line.allSatisfy({ $0 == "." || $0 == " " }) { continue }
-            kept.append(line)
+            while kept.first?.isEmpty == true { kept.removeFirst() }
+            while kept.last?.isEmpty == true { kept.removeLast() }
+            return kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-        // Trim leading/trailing blank lines
-        while kept.first?.isEmpty == true { kept.removeFirst() }
-        while kept.last?.isEmpty == true { kept.removeLast() }
+        let fromOut = clean(primary)
+        if !fromOut.isEmpty { return fromOut }
 
-        return kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        // Fall back to stderr only if it contains real prose (not just session_id)
+        return clean(secondary)
     }
 }

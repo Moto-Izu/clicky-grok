@@ -26,12 +26,9 @@ enum ClickyServiceConfig {
     /// Path to the `hermes` CLI. Empty string = auto-detect (~/.local/bin/hermes, PATH).
     static let hermesBinary = ""
 
-    /// Session name for `hermes chat --continue` (conversation continuity).
-    static let hermesSessionName = "clicky"
-
     /// Toolsets Hermes may use. `computer_use` requires `hermes computer-use install`.
-    /// `vision` helps when we attach a screenshot as eyes.
-    static let hermesToolsets = "computer_use,vision,browser,web,terminal,file,skills"
+    /// Keep vision for screenshot eyes; avoid bloated toolsets that add noisy output.
+    static let hermesToolsets = "computer_use,vision,browser,web,terminal,file"
 
     /// Max tool-calling iterations for one push-to-talk utterance.
     static let hermesMaxTurns = 40
