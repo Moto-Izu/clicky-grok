@@ -10,10 +10,26 @@
 
 [farzaa/clicky](https://github.com/farzaa/clicky) の OSS 版をベースに、
 
-- ネイティブ AI を **Claude → Grok** に変更
-- 認証を **xAI OAuth**（SuperGrok / X Premium 想定）に変更
+- ネイティブ AI を **Claude → Grok** に変更（途中段階）
+- 最終的に **Clicky = 目と口 / Local Hermes = 脳と手（computer_use / cua-driver）**
+- 認証は Hermes 側（xAI OAuth 等）。Clicky は Hermes CLI を呼ぶ
 - 日本語を優先言語にする
 - Mac でビルドして `/Applications` から起動できるようにする
+
+### 現行パイプライン（Hermes 委譲）
+
+```
+音声 → Apple Speech → スクショ(JPEG) → hermes chat -q … --image … -t computer_use,vision …
+                                              ↓ (cua-driver で実操作)
+                                         最終テキスト
+                                              ↓
+                                    Clicky TTS + [POINT] 指差し
+```
+
+設定: `ClickyServiceConfig.swift`（`hermesBinary`, `hermesToolsets`, `hermesYolo` 等）  
+実装: `HermesAgentClient.swift` + `CompanionManager.sendTranscriptToHermesWithScreenshot`
+
+**前提:** `hermes` が PATH 上にあること。`hermes computer-use install` 済みだと画面操作可能。
 
 ---
 

@@ -12,7 +12,6 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
-    @ObservedObject private var xaiOAuth = XAIOAuthAuthenticator.shared
     @State private var emailInput: String = ""
 
     var body: some View {
@@ -608,52 +607,27 @@ struct CompanionPanelView: View {
     private var xaiAuthRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Grok (xAI)")
+                Text("Brain")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
 
                 Spacer()
 
-                if xaiOAuth.isLoggingIn {
-                    ProgressView()
-                        .controlSize(.small)
-                } else if xaiOAuth.isAuthenticated {
-                    Text("Signed in")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.textTertiary)
-
-                    Button("Sign out") {
-                        companionManager.signOutOfXAI()
-                    }
-                    .font(.system(size: 11, weight: .medium))
-                    .buttonStyle(.plain)
-                    .foregroundColor(DS.Colors.textSecondary)
-                    .pointerCursor()
-                } else {
-                    Button(action: {
-                        companionManager.signInWithXAI()
-                    }) {
-                        Text("Sign in with xAI")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(DS.Colors.textPrimary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                    .fill(Color.white.opacity(0.12))
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointerCursor()
-                }
+                Text("Hermes (local)")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.white.opacity(0.12))
+                    )
             }
 
-            if let error = xaiOAuth.lastErrorMessage, !error.isEmpty {
-                Text(error)
-                    .font(.system(size: 10))
-                    .foregroundColor(.red.opacity(0.85))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text("Clicky = 目と口 / Hermes = 操作・推論（computer_use）")
+                .font(.system(size: 10))
+                .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 4)
     }
@@ -662,15 +636,14 @@ struct CompanionPanelView: View {
 
     private var modelPickerRow: some View {
         HStack {
-            Text("Model")
+            Text("Backend")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
 
             Spacer()
 
             HStack(spacing: 0) {
-                modelOptionButton(label: "Grok 4", modelID: "grok-4")
-                modelOptionButton(label: "Grok 3", modelID: "grok-3")
+                modelOptionButton(label: "Hermes", modelID: "hermes-local")
             }
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)

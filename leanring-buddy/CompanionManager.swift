@@ -68,9 +68,15 @@ final class CompanionManager: ObservableObject {
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
-    /// xAI OAuth session (SuperGrok / X Premium). Tokens live in Keychain.
+    /// xAI OAuth session (optional — Hermes uses its own auth; kept for panel status).
     let xaiOAuth = XAIOAuthAuthenticator.shared
 
+    /// Local Hermes Agent — brain + computer_use (cua-driver). Clicky is eyes/mouth only.
+    private lazy var hermesAgent: HermesAgentClient = {
+        HermesAgentClient()
+    }()
+
+    /// Legacy direct Grok client (unused by the Hermes pipeline; kept for fallback experiments).
     private lazy var grokAPI: GrokAPI = {
         return GrokAPI(model: selectedModel)
     }()
@@ -82,8 +88,7 @@ final class CompanionManager: ObservableObject {
         )
     }()
 
-    /// Conversation history so Grok remembers prior exchanges within a session.
-    /// Each entry is the user's transcript and the assistant's response.
+    /// Local conversation cache for UI / analytics (Hermes also keeps its own session).
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
 
     /// The currently running AI response task, if any. Cancelled when the user
@@ -109,21 +114,16 @@ final class CompanionManager: ObservableObject {
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
 
-    /// The Grok model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = {
-        let stored = UserDefaults.standard.string(forKey: "selectedGrokModel")
-            ?? UserDefaults.standard.string(forKey: "selectedClaudeModel")
-        // Migrate away from Claude model IDs if the user still has them stored
-        if let stored, stored.hasPrefix("claude") || stored.isEmpty {
-            return "grok-4"
-        }
-        return stored ?? "grok-4"
-    }()
+    /// Display label for the brain backend (Hermes owns the real model via its config).
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedGrokModel") ?? "hermes-local"
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedGrokModel")
-        grokAPI.model = model
+        // Direct Grok path is legacy; Hermes uses ~/.hermes model selection.
+        if model != "hermes-local" {
+            grokAPI.model = model
+        }
     }
 
     /// Opens the browser for xAI OAuth login (PKCE).
@@ -205,8 +205,8 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
-        // Eagerly touch the Grok API so its TLS warmup handshake completes
-        // well before the onboarding demo fires at ~40s into the video.
+        // Touch Hermes client (path resolution) and optional Grok TLS warmup.
+        _ = hermesAgent
         _ = grokAPI
 
         // If the user already completed onboarding AND all permissions are
@@ -547,7 +547,7 @@ final class CompanionManager: ObservableObject {
                         self?.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToGrokWithScreenshot(transcript: finalTranscript)
+                        self?.sendTranscriptToHermesWithScreenshot(transcript: finalTranscript)
                     }
                 )
             }
@@ -567,142 +567,119 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Companion Prompt
 
+    /// Instructions embedded in every Hermes turn. Clicky = eyes/mouth; Hermes = brain/hands.
     private static let companionVoiceResponseSystemPrompt = """
-    あなたは clicky。ユーザーのメニューバーに住む、親しみやすい常駐コンパニオンです。ユーザーはプッシュ・トゥ・トークで話しかけており、あなたは画面（複数可）を見ることができます。返答は読み上げ（TTS）されるので、口語で自然に話してください。会話は続いているので、前のやりとりを覚えておいてください。
+    あなたは Hermes Agent。呼び出し元は macOS の Clicky（目と口）です。
+    Clicky がユーザーの音声を文字起こしし、画面スクショを --image で渡します。あなたの返答テキストは Clicky が TTS で読み上げます。
 
-    言語:
-    - 常に日本語で返答する。ユーザーが英語や他言語で話しても、特別な指定がない限り日本語で答える。
-    - コード識別子・API名・固有の英語UIラベルはそのまま英語で残してよい。
+    役割分担:
+    - あなた（Hermes）: 計画、調査、ファイル操作、terminal、そして computer_use（cua-driver）による実際の画面操作。
+    - Clicky: 音声入力、スクショ、読み上げ、青い三角の指差し演出。
 
-    ルール:
-    - 基本は1〜2文。簡潔に。ただし「もっと詳しく」「掘り下げて」などと言われたら、長さを気にせず丁寧に説明する。
-    - カジュアルで温かい口調。絵文字は使わない。
-    - 耳で聞いてわかりやすく。短い文。箇条書き・マークダウン・記号だらけの整形はしない。
-    - 読み上げで不自然な略語や記号は避ける。「例えば」と言い、小さい数字は読みやすい形に。
-    - 質問が画面の内容と関係するなら、見えている具体的な要素に触れる。
-    - スクリーンショットが質問と無関係なら、質問そのものに直接答える。
-    - コーディング、文章、一般知識、ブレストなど何でも手伝う。
-    - 「単に」「ただ」など軽視する言い回しは避ける。
-    - コードを一字一句読み上げない。何をするコードか、どう直すかを会話で説明する。
-    - 「もっと説明してほしい？」「見せようか？」のようなはい/いいえで終わる質問は避ける。
-    - 自然なら最後に、次に試せそうな一歩や関連する発展トピックをそっと置く。不要なら無理に付け足さない。
-    - 複数画面がある場合、"primary focus" がカーソルのある画面。そこを優先し、必要なら他画面にも触れる。
+    言語: 常に日本語で最終返答する（コード識別子や英語UIラベルはそのままでよい）。
 
-    要素の指差し:
-    画面上のものを指せる青い三角カーソルがある。操作方法、メニュー探し、ボタン探しなど、指すと助かるときは積極的に使う。
+    操作:
+    - ユーザーが「押して」「クリックして」「開いて」「操作して」「やって」など実行を求めている、または明らかに代行が必要なら computer_use を使う。
+    - 説明だけでよい質問には無理に操作しない。
+    - computer_use が使えない場合は、何ができなかったかを日本語で短く伝える。
+    - 危険な破壊操作・パスワード入力・権限ダイアログの操作はしない。
 
-    一般知識だけで画面と無関係なとき、すでに見ているものを指すだけになるときなど、意味がない指差しはしない。関連するUI・メニュー・ボタン・領域があるなら指す。
+    返答フォーマット（必須）:
+    - 読み上げ用に、カジュアルで短い口語の日本語。基本1〜3文。耳で聞いてわかるように。
+    - 箇条書きやマークダウンは避け、会話調で。
+    - 画面上の要素をユーザーに見せたいときだけ、本文の最後に座標タグを付ける（Clicky の青い三角用）。
+      形式: [POINT:x,y:ラベル] または [POINT:none]
+      座標は添付スクショのピクセル空間（左上が原点、x右、y下）。画像ラベルの寸法を使う。
+    - 操作を実行した場合は、何をしたかを一文で報告してからタグを付ける。
 
-    指すときは、読み上げ用の本文のあとに座標タグを付ける。画像にはピクセル寸法がラベルされている。その寸法を座標空間として使う。原点(0,0)は画像の左上。xは右、yは下方向。
-
-    形式: [POINT:x,y:ラベル]  x,yは整数ピクセル。ラベルは短い日本語か短い英語（例: 検索欄 / 保存ボタン）。カーソル画面なら screen 番号は省略可。別画面なら :screenN（Nは画像ラベルの画面番号）。
-
-    指す必要がなければ [POINT:none]。
-
-    例:
-    - Final Cut のカラー調整: "カラーインスペクタを開いて。ツールバー右上あたりにあるよ。開くとカラーホイールやカーブが出てくる。[POINT:1100,42:カラーインスペクタ]"
-    - HTMLとは: "htmlはウェブページの骨格になるマークアップ言語だよ。今見てるcssとどうつながるかも気になるところ。[POINT:none]"
-    - Xcodeでコミット: "上のソース管理メニューからコミットできるよ。ショートカットはコマンドオプションc。[POINT:285,11:ソース管理]"
-    - 画面2の要素: "もう一台のモニタのターミナルだね。[POINT:400,300:ターミナル:screen2]"
+    添付画像:
+    - あればカーソルがある画面のスクショ。computer_use の capture で最新状態を取り直してよい。
     """
 
     // MARK: - AI Response Pipeline
 
-    /// Captures a screenshot, sends it along with the transcript to Grok,
-    /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
-    /// the spinner/processing state until TTS audio begins playing.
-    /// Grok's response may include a [POINT:x,y:label] tag which triggers
-    /// the buddy to fly to that element on screen.
-    private func sendTranscriptToGrokWithScreenshot(transcript: String) {
+    /// Eyes + mouth pipeline: screenshot + transcript → local Hermes (brain/hands)
+    /// → TTS + optional overlay pointing. Computer use runs inside Hermes/cua-driver.
+    private func sendTranscriptToHermesWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
 
         currentResponseTask = Task {
-            // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
             do {
-                // Ensure we have a valid xAI OAuth session before calling Grok
-                if !xaiOAuth.isAuthenticated {
-                    try await xaiOAuth.login()
-                }
-
-                // Capture all connected screens so the AI has full context
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-
                 guard !Task.isCancelled else { return }
 
-                // Build image labels with the actual screenshot pixel dimensions
-                // so Grok's coordinate space matches the image it sees. We
-                // scale from screenshot pixels to display points ourselves.
-                let labeledImages = screenCaptures.map { capture in
-                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
-                    return (data: capture.imageData, label: capture.label + dimensionInfo)
+                // Prefer cursor screen as Hermes --image (eyes). Other screens described in text.
+                let primaryCapture = screenCaptures.first(where: { $0.isCursorScreen })
+                    ?? screenCaptures.first
+                guard let primaryCapture else {
+                    throw HermesAgentClientError(message: "画面キャプチャに失敗しました。")
                 }
 
-                // Pass conversation history so Grok remembers prior exchanges
-                let historyForAPI = conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-                }
-
-                let (fullResponseText, _) = try await grokAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
-                    conversationHistory: historyForAPI,
-                    userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
-                    }
+                let imagePath = try Self.writeTempScreenshotJPEG(
+                    data: primaryCapture.imageData,
+                    namePrefix: "cursor"
                 )
 
+                var screenContextLines: [String] = [
+                    "添付スクショ: \(primaryCapture.label) (image dimensions: \(primaryCapture.screenshotWidthInPixels)x\(primaryCapture.screenshotHeightInPixels) pixels)"
+                ]
+                for capture in screenCaptures where !capture.isCursorScreen {
+                    screenContextLines.append(
+                        "他画面: \(capture.label) (\(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) px) — 必要なら computer_use で capture"
+                    )
+                }
+
+                let userPrompt = """
+                ユーザー発話:
+                \(transcript)
+
+                画面コンテキスト:
+                \(screenContextLines.joined(separator: "\n"))
+                """
+
+                let (fullResponseText, _, _) = try await hermesAgent.runTurn(
+                    userPrompt: userPrompt,
+                    imagePaths: [imagePath],
+                    systemContext: Self.companionVoiceResponseSystemPrompt
+                )
+
+                // Cleanup temp image (best-effort)
+                try? FileManager.default.removeItem(atPath: imagePath)
+
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Grok's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if Grok returned coordinates.
-                // Switch to idle BEFORE setting the location so the triangle
-                // becomes visible and can fly to the target. Without this, the
-                // spinner hides the triangle and the flight animation is invisible.
                 let hasPointCoordinate = parseResult.coordinate != nil
                 if hasPointCoordinate {
                     voiceState = .idle
                 }
 
-                // Pick the screen capture matching Grok's screen number,
-                // falling back to the cursor screen if not specified.
                 let targetScreenCapture: CompanionScreenCapture? = {
                     if let screenNumber = parseResult.screenNumber,
                        screenNumber >= 1 && screenNumber <= screenCaptures.count {
                         return screenCaptures[screenNumber - 1]
                     }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
+                    return primaryCapture
                 }()
 
                 if let pointCoordinate = parseResult.coordinate,
                    let targetScreenCapture {
-                    // Grok's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
                     let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
                     let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
                     let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
                     let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
                     let displayFrame = targetScreenCapture.displayFrame
 
-                    // Clamp to screenshot coordinate space
                     let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
                     let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
                     let displayLocalX = clampedX * (displayWidth / screenshotWidth)
                     let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
                     let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
                     let globalLocation = CGPoint(
                         x: displayLocalX + displayFrame.origin.x,
                         y: appKitY + displayFrame.origin.y
@@ -716,28 +693,20 @@ final class CompanionManager: ObservableObject {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
                 }
 
-                // Save this exchange to conversation history (with the point tag
-                // stripped so it doesn't confuse future context)
                 conversationHistory.append((
                     userTranscript: transcript,
                     assistantResponse: spokenText
                 ))
-
-                // Keep only the last 10 exchanges to avoid unbounded context growth
                 if conversationHistory.count > 10 {
                     conversationHistory.removeFirst(conversationHistory.count - 10)
                 }
 
-                print("🧠 Conversation history: \(conversationHistory.count) exchanges")
-
+                print("🧠 Hermes session history (local cache): \(conversationHistory.count) exchanges")
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
-                // Play the response via TTS. Keep the spinner (processing state)
-                // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     do {
                         try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after playback starts
                         voiceState = .responding
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
@@ -746,7 +715,7 @@ final class CompanionManager: ObservableObject {
                     }
                 }
             } catch is CancellationError {
-                // User spoke again — response was interrupted
+                // interrupted
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
@@ -758,6 +727,16 @@ final class CompanionManager: ObservableObject {
                 scheduleTransientHideIfNeeded()
             }
         }
+    }
+
+    /// Writes JPEG bytes to a temp path for Hermes `--image`.
+    private static func writeTempScreenshotJPEG(data: Data, namePrefix: String) throws -> String {
+        let dir = ClickyServiceConfig.hermesImageTempDirectory
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let name = "\(namePrefix)-\(Int(Date().timeIntervalSince1970 * 1000)).jpg"
+        let url = dir.appendingPathComponent(name)
+        try data.write(to: url, options: .atomic)
+        return url.path
     }
 
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
@@ -798,14 +777,9 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message when Grok / OAuth fails.
+    /// Speaks a hardcoded error message when Hermes fails.
     private func speakCreditsErrorFallback() {
-        let utterance: String
-        if !xaiOAuth.isAuthenticated {
-            utterance = "先にエックスエーアイでサインインしてね。クリックーのパネルからサインインを押して。"
-        } else {
-            utterance = "グロックとの通信でエラーが出たよ。サインイン状態を確認してもう一度試してね。"
-        }
+        let utterance = "ヘルメスとの通信でエラーが出たよ。ヘルメスが起動しているか、コンピュータユースが使えるか確認してね。"
         speakSystemFallback(utterance)
     }
 
@@ -1005,7 +979,7 @@ final class CompanionManager: ObservableObject {
     画像ラベルのピクセル寸法が座標空間。原点(0,0)は左上。x右、y下。
     """
 
-    /// Captures a screenshot and asks Grok to find something interesting to
+    /// Captures a screenshot and asks Hermes to find something interesting to
     /// point at, then triggers the buddy's flight animation. Used during
     /// onboarding to demo the pointing feature while the intro video plays.
     func performOnboardingDemoInteraction() {
@@ -1014,28 +988,25 @@ final class CompanionManager: ObservableObject {
 
         Task {
             do {
-                if !xaiOAuth.isAuthenticated {
-                    try await xaiOAuth.login()
-                }
-
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
 
-                // Only send the cursor screen so Grok can't pick something
-                // on a different monitor that we can't point at.
                 guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else {
                     print("🎯 Onboarding demo: no cursor screen found")
                     return
                 }
 
-                let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
-                let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
-
-                let (fullResponseText, _) = try await grokAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: Self.onboardingDemoSystemPrompt,
-                    userPrompt: "look around my screen and find something interesting to point at",
-                    onTextChunk: { _ in }
+                let imagePath = try Self.writeTempScreenshotJPEG(
+                    data: cursorScreenCapture.imageData,
+                    namePrefix: "onboarding"
                 )
+                let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
+
+                let (fullResponseText, _, _) = try await hermesAgent.runTurn(
+                    userPrompt: "画面を見て、中央付近の具体的なものを1つ指して。コメントは日本語で短く。",
+                    imagePaths: [imagePath],
+                    systemContext: Self.onboardingDemoSystemPrompt + "\n添付: \(cursorScreenCapture.label)\(dimensionInfo)"
+                )
+                try? FileManager.default.removeItem(atPath: imagePath)
 
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
 
