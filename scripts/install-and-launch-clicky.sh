@@ -132,14 +132,16 @@ open_privacy_panes() {
 }
 
 reset_tcc_for_bundle() {
-  # Clears prior denials so the app can re-prompt. Does not auto-grant.
+  # Intentionally NO-OP by default.
+  # Resetting TCC on every launch caused endless Grant loops (ad-hoc signature
+  # + wiped permissions). Pass CLICKY_RESET_TCC=1 only when you really need it.
+  if [[ "${CLICKY_RESET_TCC:-0}" != "1" ]]; then
+    log "Skipping TCC reset (set CLICKY_RESET_TCC=1 to force)"
+    return
+  fi
   if command -v tccutil >/dev/null 2>&1; then
     log "Resetting TCC entries for $BUNDLE_ID (will re-prompt)"
-    tccutil reset All "$BUNDLE_ID" 2>/dev/null || warn "tccutil reset skipped (needs Full Disk Access or may be restricted)"
-    tccutil reset Microphone "$BUNDLE_ID" 2>/dev/null || true
-    tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
-    tccutil reset ScreenCapture "$BUNDLE_ID" 2>/dev/null || true
-    tccutil reset SpeechRecognition "$BUNDLE_ID" 2>/dev/null || true
+    tccutil reset All "$BUNDLE_ID" 2>/dev/null || warn "tccutil reset skipped"
   fi
 }
 

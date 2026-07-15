@@ -295,44 +295,48 @@ struct CompanionPanelView: View {
                         .foregroundColor(DS.Colors.success)
                 }
             } else {
-                HStack(spacing: 6) {
-                    Button(action: {
-                        // Triggers the system accessibility prompt (AXIsProcessTrustedWithOptions)
-                        // on first attempt, then opens System Settings on subsequent attempts.
-                        WindowPositionManager.requestAccessibilityPermission()
-                    }) {
-                        Text("Grant")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(DS.Colors.textOnAccent)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule()
-                                    .fill(DS.Colors.accent)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointerCursor()
+                VStack(alignment: .trailing, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Button(action: {
+                            // One system prompt max per launch, then Settings.
+                            WindowPositionManager.requestAccessibilityPermission()
+                        }) {
+                            Text("Grant")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(DS.Colors.textOnAccent)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule()
+                                        .fill(DS.Colors.accent)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .pointerCursor()
 
-                    Button(action: {
-                        // Reveals the app in Finder so the user can drag it into
-                        // the Accessibility list if it doesn't appear automatically
-                        // (common with unsigned dev builds).
-                        WindowPositionManager.revealAppInFinder()
-                        WindowPositionManager.openAccessibilitySettings()
-                    }) {
-                        Text("Find App")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(DS.Colors.textSecondary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule()
-                                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.8)
-                            )
+                        Button(action: {
+                            WindowPositionManager.revealAppInFinder()
+                            WindowPositionManager.openAccessibilitySettings()
+                        }) {
+                            Text("Find App")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(DS.Colors.textSecondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule()
+                                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.8)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .pointerCursor()
                     }
-                    .buttonStyle(.plain)
-                    .pointerCursor()
+
+                    Text("ad-hoc署名のたび別アプリ扱い。設定から古いClickyを削除→/Applications/Clicky.appを追加→アプリ再起動")
+                        .font(.system(size: 9))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 200, alignment: .trailing)
                 }
             }
         }
@@ -420,6 +424,14 @@ struct CompanionPanelView: View {
                     Text("Granted")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(DS.Colors.success)
+                }
+            } else if companionManager.isRequestingScreenContent {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Waiting…")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
                 }
             } else {
                 Button(action: {

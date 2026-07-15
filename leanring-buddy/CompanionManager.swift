@@ -104,10 +104,13 @@ final class CompanionManager: ObservableObject {
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
 
-    /// True when all three required permissions (accessibility, screen recording,
-    /// microphone) are granted. Used by the panel to show a single "all good" state.
+    /// True when enough permissions are granted to use Clicky as eyes/mouth.
+    /// Screen Content is optional once Screen Recording works (Hermes/CUA has its own TCC).
     var allPermissionsGranted: Bool {
-        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
+        hasAccessibilityPermission
+            && hasScreenRecordingPermission
+            && hasMicrophonePermission
+            && (hasScreenContentPermission || hasScreenRecordingPermission)
     }
 
     /// Whether the blue cursor overlay is currently visible on screen.
@@ -371,6 +374,21 @@ final class CompanionManager: ObservableObject {
             hasScreenContentPermission = UserDefaults.standard.bool(forKey: "hasScreenContentPermission")
         }
 
+        // One-shot auto-clear of Screen Content gate when Screen Recording works
+        // (avoids endless Grant when SCShareableContent picker hangs).
+        if hasScreenRecordingPermission && !hasScreenContentPermission && !isRequestingScreenContent
+            && !Self.didAttemptScreenContentAutoProbe {
+            Self.didAttemptScreenContentAutoProbe = true
+            Task { @MainActor [weak self] in
+                guard let self, !self.hasScreenContentPermission else { return }
+                if await Self.probeScreenCaptureUtilityWorks() {
+                    self.hasScreenContentPermission = true
+                    UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
+                    print("🔑 Screen content auto-granted via capture probe")
+                }
+            }
+        }
+
         if !previouslyHadAll && allPermissionsGranted {
             ClickyAnalytics.trackAllPermissionsGranted()
         }
@@ -380,44 +398,78 @@ final class CompanionManager: ObservableObject {
     /// screenshot capture. Once the user approves, we persist the grant
     /// so they're never asked again during onboarding.
     @Published private(set) var isRequestingScreenContent = false
+    private static var didAttemptScreenContentAutoProbe = false
 
     func requestScreenContentPermission() {
         guard !isRequestingScreenContent else { return }
         isRequestingScreenContent = true
         Task {
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard let display = content.displays.first else {
-                    await MainActor.run { isRequestingScreenContent = false }
-                    return
+            // SCShareableContent can hang forever if the system picker is stuck.
+            // Bound the wait so the Grant button never stays disabled indefinitely.
+            let captureTask = Task { () -> Bool in
+                do {
+                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                    guard let display = content.displays.first else { return false }
+                    let filter = SCContentFilter(display: display, excludingWindows: [])
+                    let config = SCStreamConfiguration()
+                    config.width = 320
+                    config.height = 240
+                    let image = try await SCScreenshotManager.captureImage(
+                        contentFilter: filter,
+                        configuration: config
+                    )
+                    let didCapture = image.width > 0 && image.height > 0
+                    print("🔑 Screen content capture result — width: \(image.width), height: \(image.height), didCapture: \(didCapture)")
+                    return didCapture
+                } catch {
+                    print("⚠️ Screen content permission request failed: \(error)")
+                    return false
                 }
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let config = SCStreamConfiguration()
-                config.width = 320
-                config.height = 240
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                // Verify the capture actually returned real content — a 0x0 or
-                // fully-empty image means the user denied the prompt.
-                let didCapture = image.width > 0 && image.height > 0
-                print("🔑 Screen content capture result — width: \(image.width), height: \(image.height), didCapture: \(didCapture)")
-                await MainActor.run {
-                    isRequestingScreenContent = false
-                    guard didCapture else { return }
-                    hasScreenContentPermission = true
-                    UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
-                    ClickyAnalytics.trackPermissionGranted(permission: "screen_content")
-
-                    // If onboarding was already completed, show the cursor overlay now
-                    if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
-                        overlayWindowManager.hasShownOverlayBefore = true
-                        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-                        isOverlayVisible = true
-                    }
-                }
-            } catch {
-                print("⚠️ Screen content permission request failed: \(error)")
-                await MainActor.run { isRequestingScreenContent = false }
             }
+
+            let timeoutTask = Task { () -> Bool in
+                try? await Task.sleep(nanoseconds: 12_000_000_000)
+                captureTask.cancel()
+                print("⚠️ Screen content permission request timed out after 12s")
+                return false
+            }
+
+            let didCapture = await captureTask.value
+            timeoutTask.cancel()
+
+            // Fallback: if ScreenCaptureKit utility can already grab a frame,
+            // treat content permission as granted (common after Screen Recording OK).
+            let didFallbackCapture: Bool
+            if !didCapture {
+                didFallbackCapture = await Self.probeScreenCaptureUtilityWorks()
+            } else {
+                didFallbackCapture = false
+            }
+
+            await MainActor.run {
+                isRequestingScreenContent = false
+                guard didCapture || didFallbackCapture else { return }
+                hasScreenContentPermission = true
+                UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
+                ClickyAnalytics.trackPermissionGranted(permission: "screen_content")
+
+                if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
+                    overlayWindowManager.hasShownOverlayBefore = true
+                    overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                    isOverlayVisible = true
+                }
+            }
+        }
+    }
+
+    /// Non-prompting probe used after Screen Recording is already granted.
+    private static func probeScreenCaptureUtilityWorks() async -> Bool {
+        do {
+            let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+            return captures.contains { !$0.imageData.isEmpty }
+        } catch {
+            print("⚠️ Screen capture utility probe failed: \(error)")
+            return false
         }
     }
 
